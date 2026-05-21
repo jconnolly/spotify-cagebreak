@@ -1,0 +1,9 @@
+# Secrets — never commit
+token.json
+*.token
+.env
+
+# Local logs / caches
+logs/
+__pycache__/
+*.pyc
