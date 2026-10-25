@@ -15,6 +15,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -134,8 +135,10 @@ def _ollama_chat(model, system, user, schema, tries=3):
                      {"role": "user", "content": user}],
         "format": schema,
         "stream": False,
-        "options": {"temperature": 0.9, "num_ctx": 4096},
+        "options": {"temperature": 0.9, "num_ctx": 8192},  # 4096 let gpt-oss reasoning eat the whole window -> empty content
     }
+    if "gpt-oss" in model:
+        payload["think"] = "low"               # keep reasoning short so JSON output fits
     data = json.dumps(payload).encode()
     last = None
     for attempt in range(tries):
@@ -198,9 +201,17 @@ def _find_artist(name):
     """Return (artist_id, canonical_name) for the best Spotify match, or None."""
     res = sc.get("/search", {"q": name, "type": "artist", "limit": 5, "market": "US"})
     for a in res.get("artists", {}).get("items", []):
-        if br._artist_match(a["name"], name):
+        if br.norm(a["name"]) == br.norm(name):   # exact: substring let "Pylon" hit "Pylon Eskan"
             return a["id"], a["name"]
     return None
+
+
+# whole words only: a bare substring "live" also hit "Alive" / "Deliver"
+ALT_TAKES = re.compile(r"\b(live|instrumental|remix|acoustic|session|demo)\b", re.I)
+
+
+def _is_alt(name):
+    return bool(ALT_TAKES.search(name))
 
 
 def _signature(artist_id):
@@ -208,11 +219,14 @@ def _signature(artist_id):
     Avoids /top-tracks (403 on this app). Returns (uri, track, album, year) or None."""
     albums = br._fetch_artist_albums(artist_id)        # offset-paged, known-good
     full = [a for a in albums if a.get("album_type") == "album"] or albums
+    # skip live / instrumental / remix editions when a studio record exists
+    full = [a for a in full if not _is_alt(a["name"])] or full
     if not full:
         return None
     full.sort(key=lambda a: a.get("release_date", ""), reverse=True)  # newest first
     al = full[0]
     tr = br.pick_tracks(al["id"], artist_id)           # top-tracks(403)→album-cut fallback
+    tr = [t for t in tr if not _is_alt(t["name"])]
     if not tr:
         return None
     return tr[0]["uri"], tr[0]["name"], al["name"], (al.get("release_date", "") or "")[:4]
@@ -301,7 +315,7 @@ def main():
         print("\nDRY run — no playlist created, history not updated.")
         return
 
-    name = f"🗓 cage-break — week of {week}"
+    name = f"Wk {week[5:]}"  # short: car display truncates at ~12 chars
     desc = (f"Weekly algorithm-cage-break discovery, {len(resolved)} new artists "
             f"adjacent to your taste. Generated {week} locally by {args.model}.")
     pl = sc.post("/me/playlists", {"name": name, "public": False, "description": desc})

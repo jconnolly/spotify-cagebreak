@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Shared Spotify helpers: token load + auto-refresh + GET/paged GET.
 
-Reads /tmp/bee/token.json (must contain refresh_token + client_id, written
+Reads token.json (next to this file) (must contain refresh_token + client_id, written
 by spotify_auth.py). Refreshes the access token in-place when it 401s.
 """
 import json
@@ -13,6 +13,11 @@ import urllib.error
 
 TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.json")
 API = "https://api.spotify.com/v1"
+MAX_WAIT = 300  # seconds; longer Retry-After means a ban, not a blip
+
+
+class RateLimited(RuntimeError):
+    pass
 
 
 def _load():
@@ -65,6 +70,8 @@ def get(path, params=None, _retry=True):
             return get(path, params, _retry=False)
         if e.code == 429:
             wait = int(e.headers.get("Retry-After", "2")) + 1
+            if wait > MAX_WAIT:                    # multi-hour ban: fail fast, don't hang
+                raise RateLimited(f"Spotify rate-limited {path.split('?')[0]} for {wait}s") from e
             time.sleep(wait)
             return get(path, params, _retry=_retry)
         raise
@@ -89,8 +96,29 @@ def post(path, body, _retry=True):
             return post(path, body, _retry=False)
         if e.code == 429:
             wait = int(e.headers.get("Retry-After", "2")) + 1
+            if wait > MAX_WAIT:                    # multi-hour ban: fail fast, don't hang
+                raise RateLimited(f"Spotify rate-limited {path.split('?')[0]} for {wait}s") from e
             time.sleep(wait)
             return post(path, body, _retry=_retry)
+        raise
+
+
+def delete(path, body, _retry=True):
+    """DELETE with a JSON body to an absolute path (starting with /); returns parsed JSON."""
+    tok = _load()
+    url = path if path.startswith("http") else API + path
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {tok['access_token']}", "Content-Type": "application/json"},
+        method="DELETE",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        if e.code == 401 and _retry:
+            _refresh()
+            return delete(path, body, _retry=False)
         raise
 
 
