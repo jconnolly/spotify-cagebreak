@@ -207,7 +207,7 @@ def ask_claude(taste, want, exclude):
     prompt = (
         f"{PERSONA}\n\n"
         f"What he has liked lately (artist — track):\n" + "\n".join(liked) + "\n\n"
-        f"Exclusion list (owned or already sent):\n{', '.join(sorted(exclude)[:800])}\n\n"
+        f"Exclusion list (owned or already sent):\n{', '.join(sorted(exclude))}\n\n"
         f"Name exactly {per} artists for EACH bucket: {', '.join(BUCKETS)}.\n"
         "Reply with ONLY a JSON object, no prose, no code fence:\n"
         '{"<bucket>": [{"artist": "...", "why": "..."}, ...], ...}'

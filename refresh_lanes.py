@@ -99,7 +99,7 @@ def ask_claude(lanes, taste, exclude_names, ask):
         ask=ask,
         liked="\n".join(liked),
         top=", ".join(top),
-        exclude=", ".join(sorted(exclude_names)[:600]),
+        exclude=", ".join(sorted(exclude_names)),
         lanes="\n".join(f"- {name}: {brief}" for _, name, brief in lanes),
     )
     return wr.claude_json(prompt, MODEL)
