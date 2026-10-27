@@ -3,19 +3,22 @@
 
 Each run:
   1. refresh Spotify taste (headless token refresh, no browser)
-  2. ask a local Ollama model for fresh opinionated picks adjacent to John's
-     taste but NOT in his library and NOT recommended before
+  2. ask Claude (headless `claude -p`, default) or a local Ollama model for
+     fresh opinionated picks adjacent to John's taste but NOT in his library
+     and NOT recommended before
   3. resolve picks to Spotify, build ONE dated discovery playlist
   4. record picks in history.json (so next week never repeats) + write a digest
 
-Needs:  Ollama running locally (`ollama serve`) with the model below pulled.
-Run:    python3 weekly_recs.py [--dry] [--n 24] [--model glm-4.7-flash:latest]
+Needs:  the `claude` CLI logged in; or, with --engine ollama, Ollama running
+        locally (`ollama serve`) with the model below pulled.
+Run:    python3 weekly_recs.py [--dry] [--n 24] [--engine claude|ollama] [--model gpt-oss:20b]
 """
 import argparse
 import datetime as dt
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -35,6 +38,8 @@ OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 MODEL = "gpt-oss:20b"  # fast MoE; override with --model (glm-4.7-flash richer but slow/OOM-prone)
 TARGET = 24            # tracks in the weekly playlist (1 per artist)
 LLM_TIMEOUT = 900      # seconds; covers cold model load + generation
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", os.path.expanduser("~/.local/bin/claude"))
+CLAUDE_MODEL = "sonnet"  # Ollama hallucinated ~half its names; Claude names real artists
 
 BUCKETS = ["punk", "folk", "electronic", "indie", "hipstercore", "chiptune"]
 
@@ -168,8 +173,56 @@ def _ask_bucket(model, bucket, n, known, sent):
             for a in out.get("artists", []) if a.get("artist")]
 
 
+def claude_json(prompt, model=CLAUDE_MODEL):
+    """Run a headless `claude -p` call and parse the JSON object it replies with."""
+    res = subprocess.run(
+        [CLAUDE_BIN, "-p", "--model", model, "--output-format", "json"],
+        input=prompt, capture_output=True, text=True, timeout=LLM_TIMEOUT, cwd=HERE,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"claude -p failed ({res.returncode}): {res.stderr[-500:]}")
+    out = json.loads(res.stdout)
+    if isinstance(out, list):                  # newer CLI: event list, result last
+        out = next(e for e in reversed(out) if e.get("type") == "result")
+    text = out["result"]
+    start, end = text.find("{"), text.rfind("}")
+    return json.loads(text[start:end + 1])
+
+
+def _interleave(by_bucket):
+    """Round-robin across buckets so they fill evenly."""
+    picks, i = [], 0
+    while any(i < len(by_bucket[b]) for b in BUCKETS):
+        for b in BUCKETS:
+            if i < len(by_bucket[b]):
+                picks.append(by_bucket[b][i])
+        i += 1
+    return picks
+
+
+def ask_claude(taste, want, exclude):
+    """One call for all buckets; Claude takes the full exclusion set."""
+    per = want // len(BUCKETS) + 3   # buffer for owned/dupe/not-found skips
+    liked = [f"{t.get('artist', '')} — {t.get('name', '')}" for t in taste.get("saved_tracks", [])[:60]]
+    prompt = (
+        f"{PERSONA}\n\n"
+        f"What he has liked lately (artist — track):\n" + "\n".join(liked) + "\n\n"
+        f"Exclusion list (owned or already sent):\n{', '.join(sorted(exclude)[:800])}\n\n"
+        f"Name exactly {per} artists for EACH bucket: {', '.join(BUCKETS)}.\n"
+        "Reply with ONLY a JSON object, no prose, no code fence:\n"
+        '{"<bucket>": [{"artist": "...", "why": "..."}, ...], ...}'
+    )
+    out = claude_json(prompt)
+    by_bucket = {}
+    for b in BUCKETS:
+        by_bucket[b] = [{"bucket": b, "artist": a["artist"], "why": a.get("why", "")}
+                        for a in out.get(b, []) if a.get("artist")]
+        print(f"  {b:11} {len(by_bucket[b])} candidates")
+    return _interleave(by_bucket)
+
+
 def ask_llm(taste, history, want, model):
-    """One small call per bucket (large arrays 500 the constrained decoder).
+    """Ollama: one small call per bucket (large arrays 500 the constrained decoder).
     Returns candidates round-robin-interleaved so buckets fill evenly."""
     recent_recs = [r for r in history["recommended"] if r["week"] != "seed"][-40:]
     sent = sorted({r["artist"] for r in recent_recs})
@@ -187,14 +240,7 @@ def ask_llm(taste, history, want, model):
             print(f"  {b:11} FAILED ({type(e).__name__})")
             by_bucket[b] = []
         time.sleep(2)                          # let the runner settle between calls
-
-    picks, i = [], 0
-    while any(i < len(by_bucket[b]) for b in BUCKETS):
-        for b in BUCKETS:
-            if i < len(by_bucket[b]):
-                picks.append(by_bucket[b][i])
-        i += 1
-    return picks
+    return _interleave(by_bucket)
 
 
 def _find_artist(name):
@@ -251,7 +297,11 @@ def resolve(picks, exclude, want):
         if key in exclude or key in seen:      # match landed on owned, or repeated
             print(f"  skip (owned/dupe): {canon}")
             continue
-        sig = _signature(aid)
+        try:
+            sig = _signature(aid)
+        except sc.RateLimited as e:            # hand back what landed so callers can keep it
+            e.partial = out
+            raise
         if not sig:
             print(f"  ✗ no tracks: {canon}")
             continue
@@ -283,10 +333,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry", action="store_true", help="resolve + print, no playlist, no history write")
     ap.add_argument("--n", type=int, default=TARGET)
-    ap.add_argument("--model", default=MODEL, help="Ollama model tag")
+    ap.add_argument("--engine", choices=["claude", "ollama"], default="claude")
+    ap.add_argument("--model", default=MODEL, help="Ollama model tag (--engine ollama)")
     args = ap.parse_args()
 
-    if not ollama_up():
+    if args.engine == "ollama" and not ollama_up():
         sys.exit(f"ERROR: Ollama not reachable at {OLLAMA_URL}. Start it: ollama serve")
 
     week = dt.date.today().isoformat()
@@ -299,11 +350,21 @@ def main():
     exclude = exclusion_artists(taste, history)
     print(f"exclusion set: {len(exclude)} artists\n")
 
-    print(f"asking Ollama ({args.model}) per bucket…")
-    picks = ask_llm(taste, history, args.n, args.model)
+    if args.engine == "claude":
+        engine = f"Claude ({CLAUDE_MODEL})"
+        print(f"asking {engine}…")
+        picks = ask_claude(taste, args.n, exclude)
+    else:
+        engine = args.model
+        print(f"asking Ollama ({engine}) per bucket…")
+        picks = ask_llm(taste, history, args.n, args.model)
     print(f"got {len(picks)} candidate artists. resolving on Spotify…\n")
 
-    resolved = resolve(picks, exclude, args.n)
+    try:
+        resolved = resolve(picks, exclude, args.n)
+    except sc.RateLimited as e:
+        resolved = e.partial
+        print(f"\nSTOPPING early: {e}. Keeping {len(resolved)} resolved so far.")
     if not resolved:
         sys.exit("nothing resolved — aborting")
     print(f"\nresolved {len(resolved)}/{args.n} target.")
@@ -317,7 +378,7 @@ def main():
 
     name = f"Wk {week[5:]}"  # short: car display truncates at ~12 chars
     desc = (f"Weekly algorithm-cage-break discovery, {len(resolved)} new artists "
-            f"adjacent to your taste. Generated {week} locally by {args.model}.")
+            f"adjacent to your taste. Generated {week} by {engine}.")
     pl = sc.post("/me/playlists", {"name": name, "public": False, "description": desc})
     uris = [u for u, _ in resolved]
     for i in range(0, len(uris), 100):

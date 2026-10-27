@@ -15,7 +15,6 @@ import argparse
 import datetime as dt
 import json
 import os
-import subprocess
 import sys
 import time
 from itertools import zip_longest
@@ -27,11 +26,9 @@ import weekly_recs as wr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIGEST_DIR = os.path.join(HERE, "digests")
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN", os.path.expanduser("~/.local/bin/claude"))
 MODEL = "sonnet"
 PER = 5          # new tracks added per lane per run
 ASK = 9          # artists requested per lane (buffer for owned/not-found skips)
-CLAUDE_TIMEOUT = 900
 
 # (playlist_id, name, brief). Names stay <=12 chars: car display truncates.
 LANES = [
@@ -105,19 +102,7 @@ def ask_claude(lanes, taste, exclude_names, ask):
         exclude=", ".join(sorted(exclude_names)[:600]),
         lanes="\n".join(f"- {name}: {brief}" for _, name, brief in lanes),
     )
-    res = subprocess.run(
-        [CLAUDE_BIN, "-p", "--model", MODEL, "--output-format", "json"],
-        input=prompt, capture_output=True, text=True, timeout=CLAUDE_TIMEOUT,
-        cwd=HERE,
-    )
-    if res.returncode != 0:
-        raise RuntimeError(f"claude -p failed ({res.returncode}): {res.stderr[-500:]}")
-    out = json.loads(res.stdout)
-    if isinstance(out, list):                      # newer CLI: event list, result last
-        out = next(e for e in reversed(out) if e.get("type") == "result")
-    text = out["result"]
-    start, end = text.find("{"), text.rfind("}")
-    return json.loads(text[start:end + 1])
+    return wr.claude_json(prompt, MODEL)
 
 
 def write_digest(day, added):
