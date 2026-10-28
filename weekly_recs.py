@@ -253,11 +253,12 @@ def _find_artist(name):
 
 
 # whole words only: a bare substring "live" also hit "Alive" / "Deliver"
-ALT_TAKES = re.compile(r"\b(live|instrumental|remix|acoustic|session|demo)\b", re.I)
+ALT_TAKES = re.compile(r"\b(live|instrumental|remix|acoustic|session|demo|mix|edit|versions?)\b", re.I)
+RADIO_TAG = re.compile(r"\((?:[KW][A-Z]{2,3})(?:[- ]?FM)?\)")   # station sessions, e.g. "(WLUW)", "(KEXP)"
 
 
 def _is_alt(name):
-    return bool(ALT_TAKES.search(name))
+    return bool(ALT_TAKES.search(name) or RADIO_TAG.search(name))
 
 
 def _signature(artist_id):

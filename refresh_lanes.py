@@ -133,6 +133,12 @@ def main():
         lanes = [l for l in LANES if l[1].lower() in want]
         if not lanes:
             sys.exit(f"no lanes match {args.lanes!r}")
+    # Starved lanes first: a rate-limit stop hits the tail, so the tail must rotate.
+    last = {}
+    for r in wr.load_history()["recommended"]:
+        if r.get("lane"):
+            last[r["lane"]] = max(last.get(r["lane"], ""), r["week"])
+    lanes = sorted(lanes, key=lambda l: last.get(l[1], ""))
 
     day = dt.date.today().isoformat()
     print(f"=== lane refresh: {day} ({len(lanes)} lanes, +{args.per} each) ===")
